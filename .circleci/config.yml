@@ -1,0 +1,245 @@
+---
+version: 2.1
+
+orbs:
+  terraform: twdps/terraform@0.6.0
+  kube: twdps/kube-ops@0.2.0
+  op: twdps/onepassword@1.0.0
+  do: twdps/pipeline-events@0.1.0
+
+# ==== global pipeline parameters
+
+parameters:
+  context:
+    description: circleci context for all jobs
+    type: string
+    default: cohorts
+  terraform-version:
+    description: terraform version for all jobs
+    type: string
+    default: "1.2.2"
+  executor-image:
+    description: image to use for local jobs
+    type: string
+    default: twdps/circleci-kube-ops:alpine-stable
+
+# ==== triggers
+
+on-push-main: &on-push-main
+  branches:
+    only: /main/
+  tags:
+    ignore: /.*/
+
+on-tag-main: &on-tag-main
+  branches:
+    ignore: /.*/
+  tags:
+    only: /.*/
+
+commands:
+
+  set-environment:
+    parameters:
+      cluster:
+        description: target kubernetes cluster
+        type: string
+      source-env:
+        description: file to source to BASH_ENV
+        type: string
+    steps:
+      - op/env:
+          env-file: << parameters.source-env >>
+      - run:
+          name: write << parameters.cluster >>.auto.tfvars.json from template
+          command: op inject -i environments/<< parameters.cluster >>.auto.tfvars.json.tpl -o << parameters.cluster >>.auto.tfvars.json
+      - run:
+          name: pull kubeconfig
+          command: |
+            mkdir -p ~/.kube
+            ENV=<< parameters.cluster >> op inject -i tpl/kubeconfig.tpl -o ~/.kube/config
+
+  deploy-servicemesh-components:
+    parameters:
+      cluster:
+        description: target kubernetes cluster
+        type: string
+        default: $CLUSTER
+    steps:
+      - run:
+          name: deploy istio operator and matching version manifest
+          command: bash scripts/deploy_istio.sh << parameters.cluster >> inplace
+      - run:
+          name: deploy istio monitors
+          command: bash scripts/deploy_monitors.sh << parameters.cluster >>
+      - run:
+          name: deploy default cluster mtls namespace
+          command: kubectl apply -f tpl/lab-system-mtls-namespace.yaml
+
+  deploy-mesh-tools:
+    parameters:
+      cluster:
+        description: target kubernetes cluster
+        type: string
+        default: $CLUSTER
+    steps:
+      - run:
+          name: deploy kiali
+          command: bash scripts/deploy_kiali.sh << parameters.cluster >>
+
+  validate-servicemesh-components:
+    parameters:
+      cluster:
+        description: target kubernetes cluster
+        type: string
+        default: $CLUSTER
+    steps:
+      - run:
+          name: validate istio deployment
+          command: CLUSTER=<< parameters.cluster >> bats test/validate_istio.bats
+      - run:
+          name: validate mesh tools
+          command: CLUSTER=<< parameters.cluster >> bats test/validate_mesh_tools.bats
+
+jobs:
+  deploy-servicemesh:
+    docker:
+      - image: << pipeline.parameters.executor-image >>
+    shell: << parameters.shell >>
+    parameters:
+      cluster:
+        description: target kubernetes cluster
+        type: string
+        default: ""
+      shell:
+        description: shell option directive
+        type: string
+        default: /bin/bach -eo pipefail
+      source-env:
+        description: env file to source to BASH_ENV
+        type: string
+    steps:
+      - checkout
+      - setup_remote_docker
+      - set-environment:
+          cluster: << parameters.cluster >>
+          source-env: << parameters.source-env >>
+      - deploy-servicemesh-components:
+          cluster: << parameters.cluster >>
+      - deploy-mesh-tools:
+          cluster: << parameters.cluster >>
+      - validate-servicemesh-components:
+          cluster: << parameters.cluster >>
+
+  validate-servicemesh:
+    docker:
+      - image: << pipeline.parameters.executor-image >>
+    shell: << parameters.shell >>
+    parameters:
+      cluster:
+        description: target kubernetes cluster
+        type: string
+        default: ""
+      shell:
+        description: shell option directive
+        type: string
+        default: /bin/bach -eo pipefail
+      source-env:
+        description: env file to source to BASH_ENV
+        type: string
+    steps:
+      - checkout
+      - setup_remote_docker
+      - set-environment:
+          cluster: << parameters.cluster >>
+          source-env: << parameters.source-env >>
+      - validate-servicemesh-components:
+          cluster: << parameters.cluster >>
+
+  update-dashboards:
+    parameters:
+      cluster:
+        description: cluster monitors to update
+        type: string
+      shell:
+        description: shell option directive
+        type: string
+        default: /bin/bash -eo pipefail
+      source-env:
+        description: .env file to source into BASH_ENV
+        type: string
+    docker:
+      - image: << pipeline.parameters.executor-image >>
+    shell: << parameters.shell >>
+    steps:
+      - checkout
+      - setup_remote_docker
+      - set-environment:
+          cluster: << parameters.cluster >>
+          source-env: << parameters.source-env >>
+      - run:
+          name: install requirements
+          command: pip install -r requirements.txt
+      - run:
+          name: update grafana dashboards
+          command: python scripts/deploy_dashboards.py
+
+  update-alerts:
+    parameters:
+      cluster:
+        description: cluster alerts to update
+        type: string
+      shell:
+        description: shell option directive
+        type: string
+        default: /bin/bash -eo pipefail
+      source-env:
+        description: .env file to source into BASH_ENV
+        type: string
+    docker:
+      - image: << pipeline.parameters.executor-image >>
+    shell: << parameters.shell >>
+    steps:
+      - checkout
+      - setup_remote_docker
+      - set-environment:
+          cluster: << parameters.cluster >>
+          source-env: << parameters.source-env >>
+      - run:
+          name: install requirements
+          command: pip install -r requirements.txt
+      - run:
+          name: update grafana alerts
+          command: python scripts/deploy_alerts.py << parameters.cluster >>
+
+workflows:
+  version: 2
+  release servicemesh to prod-us-east-2:
+    jobs:
+      - deploy-servicemesh:
+          name: release prod-us-east-2 servicemesh
+          context: << pipeline.parameters.context >>
+          shell:  op run --env-file=op.env -- /bin/bash -eo pipefail
+          source-env: op.env
+          cluster: prod-us-east-2
+          filters: *on-push-main
+
+      - update-dashboards:
+          name: update prod-us-east-2 dashboards
+          context: << pipeline.parameters.context >>
+          shell:  op run --env-file op.env -- /bin/bash -eo pipefail
+          source-env: op.env
+          cluster: prod-us-east-2
+          requires:
+            - release prod-us-east-2 servicemesh
+          filters: *on-push-main
+
+      - update-alerts:
+          name: update prod-us-east-1 alerts
+          context: << pipeline.parameters.context >>
+          shell:  op run --env-file op.env -- /bin/bash -eo pipefail
+          source-env: op.env
+          cluster: prod-us-east-2
+          requires:
+            - update prod-us-east-2 dashboards
+          filters: *on-push-main

@@ -1,0 +1,16 @@
+
+local.env
+.notes
+sandbox_config
+test_config
+.venv
+.terraform/
+terrform.*
+.terraform.lock.hcl
+Pipfile.lock
+credentials
+istio-1*
+*.auto.tfvars.json
+sandbox.json
+kubeconfig
+istio-monitors/*.yaml
