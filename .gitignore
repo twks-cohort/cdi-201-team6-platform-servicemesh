@@ -14,3 +14,4 @@ istio-1*
 sandbox.json
 kubeconfig
 istio-monitors/*.yaml
+.idea
